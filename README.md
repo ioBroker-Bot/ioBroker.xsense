@@ -234,6 +234,8 @@ or if you have a VM on proxmox check your CPU settings
 ### 0.0.1 (2025-07-27)
 * (arteck) initial release
 
+[Older changelogs can be found there](CHANGELOG_OLD.md)
+
 ## License
 
 MIT License
