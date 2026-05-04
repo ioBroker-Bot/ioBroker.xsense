@@ -1,6 +1,6 @@
 {
   "name": "iobroker.xsense",
-  "version": "0.5.1",
+  "version": "0.6.1",
   "description": "Manage your xsense Bridge and Sensors",
   "main": "main.js",
   "repository": {
@@ -25,7 +25,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@aws-sdk/client-cognito-identity-provider": "^3.1034.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.1037.0",
     "@iobroker/adapter-core": "^3.3.2",
     "aedes": "^0.51.3",
     "aedes-persistence-nedb": "^2.0.3",
@@ -45,7 +45,7 @@
     "@tsconfig/node14": "^14.1.8",
     "@types/node": "^25.5.2",
     "@types/node-schedule": "^2.1.8",
-    "typescript": "~6.0.2"
+    "typescript": "~6.0.3"
   },
   "files": [
     "admin{,/!(src)/**}/!(tsconfigtsconfig.*).json",
@@ -61,6 +61,7 @@
     "test:package": "mocha test/package --exit",
     "test:integration": "mocha test/integration --exit",
     "test": "npm run test:js && npm run test:package",
+    "gen:test": "mocha test/*.js --timeout 60000",
     "check": "tsc --noEmit -p tsconfig.check.json",
     "lint": "eslint .",
     "translate": "translate-adapter",

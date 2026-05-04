@@ -1,13 +1,13 @@
 'use strict';
 
-const utils        = require('@iobroker/adapter-core');
-const { XSenseClient, batInfoToPercent } = require('./lib/xsenseClient');
-const Json2iobXSense   = require('./lib/json2iob');
+const utils = require('@iobroker/adapter-core');
+const {XSenseClient} = require('./lib/xsenseClient');
+const Json2iobXSense = require('./lib/json2iob');
 const MqttServerController = require('./lib/mqttServerController').MqttServerController;
-const mqtt  = require('mqtt');
+const DeviceController = require('./lib/deviceController').DeviceController;
+const mqtt = require('mqtt');
 const tools = require('./lib/tools');
 
-// node-fetch als globales fetch bereitstellen (wird in XSenseClient genutzt)
 global.fetch = require('node-fetch-commonjs');
 
 // ─── Modul-globale MQTT-Objekte ───────────────────────────────────────────────
@@ -18,19 +18,20 @@ let messageParseMutex = Promise.resolve();
 // ─────────────────────────────────────────────────────────────────────────────
 class XSenseAdapter extends utils.Adapter {
     constructor(options = {}) {
-        super({ ...options, name: 'xsense' });
+        super({...options, name: 'xsense'});
 
-        this.json2iob     = new Json2iobXSense(this);
+        this.json2iob = new Json2iobXSense(this);
         this.xsenseClient = null;
-
-        this.pythonConnected  = false;
+        this.deviceController = null;
         this._requestInterval = null;
+        this.houseCache = null; // Cache für Haus-Objekte (für MQTT-Topic-Auflösung)
+
         /** Bereits beim MQTT-Broker subscribed Topics – verhindert Duplikate */
         this._mqttSubscribedTopics = new Set();
 
-        this.on('ready',       this.onReady.bind(this));
+        this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
-        this.on('unload',      this.onUnload.bind(this));
+        this.on('unload', this.onUnload.bind(this));
     }
 
     // ─── onReady ─────────────────────────────────────────────────────────────
@@ -39,7 +40,7 @@ class XSenseAdapter extends utils.Adapter {
         try {
             this.log.info('[XSense] Adapter startet...');
 
-            await this._ensureInfoStates();
+            await this.ensureInfoStates();
             await this.json2iob.createStaticDeviceObject();
 
             let loginGo = true;
@@ -63,10 +64,16 @@ class XSenseAdapter extends utils.Adapter {
                 return;
             }
 
+            this.deviceController = new DeviceController(
+                this,
+                this.houseCache,
+                this.config
+            );
+
             await this.setAllAvailableToFalse();
 
             // Session wiederherstellen oder neu einloggen
-            this.xsenseClient = await this._initSession();
+            this.xsenseClient = await this.initSession();
 
             if (this.xsenseClient) {
                 this.setState('info.connection', true, true);
@@ -87,7 +94,7 @@ class XSenseAdapter extends utils.Adapter {
      *
      * @returns {Promise<XSenseClient>}
      */
-    async _initSession() {
+    async initSession() {
         let client = null;
 
         // Gespeicherte Session laden
@@ -107,10 +114,10 @@ class XSenseAdapter extends utils.Adapter {
         await client.init();
 
         // Login wenn nötig
-        if (client._isAccessTokenExpiring()) {
+        if (client.isAccessTokenExpiring()) {
             this.log.info('[XSense] Führe Login durch...');
             await client.login(this.config.userEmail, this.config.userPassword);
-            await this._saveSession(client);
+            await this.saveSession(client);
             this.log.info('[XSense] Login erfolgreich');
         } else {
             this.log.info('[XSense] Nutze bestehende Session');
@@ -124,9 +131,9 @@ class XSenseAdapter extends utils.Adapter {
      *
      * @param {XSenseClient} client
      */
-    async _saveSession(client) {
+    async saveSession(client) {
         try {
-            this.setState('info.session', { val: client.serialize(), ack: true });
+            this.setState('info.session', {val: client.serialize(), ack: true});
         } catch (e) {
             this.log.warn(`[XSense] Session konnte nicht gespeichert werden: ${e.message}`);
         }
@@ -151,21 +158,18 @@ class XSenseAdapter extends utils.Adapter {
         }
     }
 
-    async datenVerarbeiten(firstTry, forceFullRefresh = false, retryCount = 0) {
+    async datenVerarbeiten(firstTry, forceFullRefresh = false) {
         this.log.debug('[XSense] datenVerarbeiten');
-
-        const MAX_RETRIES    = 3;
-        const RETRY_DELAY_MS = 10000;
 
         try {
             // Tokens erneuern wenn nötig
-            if (this.xsenseClient._isAccessTokenExpiring()) {
+            if (this.xsenseClient.isAccessTokenExpiring()) {
                 this.log.debug('[XSense] Access-Token läuft ab, erneuere...');
                 await this.xsenseClient.refresh();
-                await this._saveSession(this.xsenseClient);
+                await this.saveSession(this.xsenseClient);
             }
 
-            if (this.xsenseClient._isAwsTokenExpiring()) {
+            if (this.xsenseClient.isAwsTokenExpiring()) {
                 this.log.debug('[XSense] AWS-Credentials laufen ab, erneuere...');
                 await this.xsenseClient.loadAws();
             }
@@ -175,26 +179,22 @@ class XSenseAdapter extends utils.Adapter {
 
             // MQTT-Topics nachziehen falls neue Stationen hinzukamen
             if (mqttClient && !mqttClient.closed) {
-                this._subscribeMqttTopics();
-                this._requestTemperatureUpdates();
+                this.subscribeMqttTopics();
+                this.requestTemperatureUpdates();
             }
 
             // Gerätezustände:
             // - forceFullRefresh (manueller forceRefresh-Button): immer getState aufrufen
             // - MQTT aktiv: getState überspringen (Push liefert States in Echtzeit)
             // - kein MQTT:  getState per REST-API aufrufen
-            const mqttActive    = mqttClient && !mqttClient.closed;
-            const needsGetState = forceFullRefresh || !mqttActive;
+            const mqttActive = mqttClient && !mqttClient.closed;
 
             for (const house of Object.values(this.xsenseClient.houses)) {
                 for (const station of Object.values(house.stations)) {
                     try {
                         // Station-eigene Daten (Bridge: wifiRSSI, sw-Version etc.) immer laden
-                        await this.xsenseClient.getStationState(station);
-
-                        if (needsGetState) {
-                            await this.xsenseClient.getState(station);
-                        }
+                        await this.xsenseClient.getStationState(station);   // station-spezifische Daten immer laden (z.B. Bridge-Infos)
+                        await this.xsenseClient.getState(station);              // Gerätezustände bei jedem Polling laden (auch mit MQTT, da manche Daten nicht per Push kommen)
                     } catch (e) {
                         this.log.warn(`[XSense] Zustand für Station ${station.serial} Fehler: ${e.message}`);
                     }
@@ -204,31 +204,10 @@ class XSenseAdapter extends utils.Adapter {
             // In ioBroker-States schreiben
             await this.json2iob.parseHouses(this.namespace, this.xsenseClient.houses);
 
-            this.pythonConnected = true;
             this.setState('info.connection', true, true);
-
             this.log.debug(`[XSense] datenVerarbeiten abgeschlossen (MQTT-aktiv: ${mqttActive}, force: ${forceFullRefresh})`);
 
         } catch (err) {
-            // Netzwerkfehler (DNS/EAI_AGAIN, Verbindungsabbruch) → automatisch wiederholen
-            const isNetworkError =
-                err.message?.includes('EAI_AGAIN')      ||
-                err.message?.includes('ECONNREFUSED')   ||
-                err.message?.includes('ECONNRESET')     ||
-                err.message?.includes('ETIMEDOUT')      ||
-                err.message?.includes('ENOTFOUND')      ||
-                err.message?.includes('Netzwerkfehler') ||
-                err.message?.includes('network');
-
-            if (isNetworkError && retryCount < MAX_RETRIES) {
-                const waitSec = (RETRY_DELAY_MS / 1000) * (retryCount + 1);
-                this.log.warn(
-                    `[XSense] Netzwerkfehler (${err.message}) – Retry ${retryCount + 1}/${MAX_RETRIES} in ${waitSec}s...`,
-                );
-                await this.delay(waitSec * 1000);
-                return this.datenVerarbeiten(firstTry, forceFullRefresh, retryCount + 1);
-            }
-
             this.log.error(`[XSense] datenVerarbeiten Fehler: ${err.message}`);
             this.setState('info.connection', false, true);
 
@@ -238,7 +217,7 @@ class XSenseAdapter extends utils.Adapter {
                 try {
                     await this.xsenseClient.init();
                     await this.xsenseClient.login(this.config.userEmail, this.config.userPassword);
-                    await this._saveSession(this.xsenseClient);
+                    await this.saveSession(this.xsenseClient);
                     this.setState('info.connection', true, true);
                     this.log.info('[XSense] Re-Login erfolgreich');
                 } catch (loginErr) {
@@ -260,7 +239,7 @@ class XSenseAdapter extends utils.Adapter {
      * @param {string} deviceSerial
      * @returns {string}  z.B. "devices.Mein_Zuhause.15298924.00000001"
      */
-    _resolveDevicePath(bridgeSerial, deviceSerial) {
+    resolveDevicePath(bridgeSerial, deviceSerial) {
         if (this.xsenseClient?.houses) {
             for (const house of Object.values(this.xsenseClient.houses)) {
                 for (const station of Object.values(house.stations)) {
@@ -280,7 +259,8 @@ class XSenseAdapter extends utils.Adapter {
 
     async messageParse(message) {
         // Mutex: parallele Aufrufe serialisieren
-        let release;
+        let release = () => {
+        };  // Default-Wert statt undefined
         const lock = new Promise(resolve => (release = resolve));
         const prev = messageParseMutex;
         messageParseMutex = lock;
@@ -288,10 +268,6 @@ class XSenseAdapter extends utils.Adapter {
 
         try {
             if (!tools.isJson(message)) {
-                return;
-            }
-
-            if (!this.pythonConnected) {
                 return;
             }
 
@@ -309,12 +285,12 @@ class XSenseAdapter extends utils.Adapter {
 
             switch (suffix) {
                 case 'state': {
-                    const parts   = messageObj.topic.split('/').filter(Boolean);
-                    const findDp  = parts.at(-2) ?? '';
-                    const mTopic  = findDp.match(/^SBS50([^_]+)_([^_]+)_(.+)$/);
+                    const parts = messageObj.topic.split('/').filter(Boolean);
+                    const findDp = parts.at(-2) ?? '';
+                    const mTopic = findDp.match(/^SBS50([^_]+)_([^_]+)_(.+)$/);
 
-                    const bridgeId  = mTopic?.[1] ?? null;
-                    const deviceId  = mTopic?.[2] ?? null;
+                    const bridgeId = mTopic?.[1] ?? null;
+                    const deviceId = mTopic?.[2] ?? null;
                     const attribute = mTopic?.[3] ?? null;
 
                     if (!bridgeId || !deviceId || !attribute) {
@@ -323,42 +299,38 @@ class XSenseAdapter extends utils.Adapter {
                     }
 
                     // Korrekten Pfad mit Haus-Ordner auflösen
-                    const devicePath = this._resolveDevicePath(bridgeId, deviceId);
+                    const devicePath = this.resolveDevicePath(bridgeId, deviceId);
 
                     this.log.debug(`[XSense] Bridge=${bridgeId} Device=${deviceId} Attr=${attribute} → ${devicePath}`);
 
-                    // payload kann String ("Normal") ODER Objekt ({ status: "Normal" }) sein
-                    const getStatus = (payload) =>
-                        payload !== null && typeof payload === 'object'
-                            ? payload.status
-                            : String(payload ?? '');
-
                     switch (attribute) {
                         case 'battery': {
-                            const batStatus = getStatus(messageObj.payload);
                             const batLevel =
-                                batStatus === 'Normal'   ? 3 :
-                                batStatus === 'Low'      ? 2 :
-                                batStatus === 'Critical' ? 1 : 0;
-                            if (batLevel === 0 && batStatus !== '' && batStatus !== 'null') {
-                                this.log.warn(`[XSense] Unbekannter Battery-Status: "${batStatus}" für ${devicePath}`);
-                            }
-                            this.setState(`${devicePath}.batInfo`, { val: batInfoToPercent(batLevel), ack: true });
+                                messageObj.payload.status === 'Normal' ? 3 :
+                                    messageObj.payload.status === 'Low' ? 2 :
+                                        messageObj.payload.status === 'Critical' ? 1 : 0;
+                            this.setState(`${devicePath}.batInfo`, {val: batLevel, ack: true});
                             break;
                         }
                         case 'lifeend': {
                             const id = `${devicePath}.isLifeEnd`;
                             await this.setObjectNotExistsAsync(id, {
                                 type: 'state',
-                                common: { name: 'isLifeEnd', type: 'boolean', role: 'indicator', read: true, write: false },
+                                common: {
+                                    name: 'isLifeEnd',
+                                    type: 'boolean',
+                                    role: 'indicator',
+                                    read: true,
+                                    write: false
+                                },
                                 native: {},
                             });
-                            this.setState(id, { val: getStatus(messageObj.payload) === 'EOL', ack: true });
+                            this.setState(id, {val: messageObj.payload.status === 'EOL', ack: true});
                             break;
                         }
                         case 'online':
                             this.setState(`${devicePath}.online`, {
-                                val: getStatus(messageObj.payload) === 'Online', ack: true,
+                                val: messageObj.payload.status === 'Online', ack: true,
                             });
                             break;
 
@@ -366,7 +338,7 @@ class XSenseAdapter extends utils.Adapter {
                         case 'heatalarm':
                         case 'coalarm':
                             this.setState(`${devicePath}.alarmStatus`, {
-                                val: getStatus(messageObj.payload) === 'Detected', ack: true,
+                                val: messageObj.payload.status === 'Detected', ack: true,
                             });
                             break;
 
@@ -386,15 +358,15 @@ class XSenseAdapter extends utils.Adapter {
             }
         } finally {
             if (release) {
-release();
-}
+                release();
+            }
         }
     }
 
     async getTopicSuffix(topic) {
         if (typeof topic !== 'string' || topic.length === 0) {
-return null;
-}
+            return null;
+        }
         const parts = topic.split('/').filter(Boolean);
         return parts.length ? parts[parts.length - 1] : null;
     }
@@ -403,21 +375,21 @@ return null;
 
     async onStateChange(stateId, stateObj) {
         if (!stateObj || stateObj.ack) {
-return;
-}
+            return;
+        }
 
         this.log.debug(`[XSense] State-Change: ${stateId}`);
 
-        const parts      = stateId.split('.');
+        const parts = stateId.split('.');
         const controlKey = parts[3];   // 'forceRefresh' bei devices.forceRefresh
-        const lastPart   = parts[parts.length - 1]; // letztes Segment – unabhängig von Tiefe
+        const lastPart = parts[parts.length - 1]; // letztes Segment – unabhängig von Tiefe
 
         try {
             switch (controlKey) {
                 case 'forceRefresh':
                     this.log.info('[XSense] Manueller Refresh ausgelöst...');
                     await this.datenVerarbeiten(false, true);
-                    this.setState(stateId, { val: false, ack: true });
+                    this.setState(stateId, {val: false, ack: true});
                     break;
                 default:
                     // test_Alarm ist das letzte Segment – unabhängig von Haus-Ebene
@@ -440,21 +412,21 @@ return;
 
         // Pfad: xsense.0.devices.<Haus>.<bridge>.<deviceSerial>.test_Alarm
         // deviceSerial = vorletztes Segment
-        const parts        = stateId.split('.');
+        const parts = stateId.split('.');
         const deviceSerial = parts[parts.length - 2];
-        const msgStateId   = stateId.replace(/\.test_Alarm$/, '.test_Alarm_Message');
+        const msgStateId = stateId.replace(/\.test_Alarm$/, '.test_Alarm_Message');
 
-        this.setState(msgStateId, { val: 'in progress...', ack: true });
+        this.setState(msgStateId, {val: 'in progress...', ack: true});
 
         try {
             if (!this.xsenseClient) {
-throw new Error('XSenseClient nicht initialisiert');
-}
+                throw new Error('XSenseClient nicht initialisiert');
+            }
             const result = await this.xsenseClient.testAlarm(deviceSerial);
-            this.setState(msgStateId, { val: result || 'done', ack: true });
+            this.setState(msgStateId, {val: result || 'done', ack: true});
         } catch (err) {
             this.log.error(`[XSense] testAlarm Fehler: ${err.message}`);
-            this.setState(msgStateId, { val: `Fehler: ${err.message}`, ack: true });
+            this.setState(msgStateId, {val: `Fehler: ${err.message}`, ack: true});
         }
     }
 
@@ -475,8 +447,8 @@ throw new Error('XSenseClient nicht initialisiert');
             if (this.config.connectionType === 'intmqtt') {
                 try {
                     if (mqttServerController) {
-mqttServerController.closeServer();
-}
+                        mqttServerController.closeServer();
+                    }
                 } catch (e) {
                     this.log.error(e);
                 }
@@ -501,27 +473,31 @@ mqttServerController.closeServer();
     // ─── Hilfsmethoden ───────────────────────────────────────────────────────
 
     async setAllAvailableToFalse() {
-        // Wildcard ans Ende → PouchDB/CouchDB kann Index nutzen (kein Full-Scan-Fallback)
-        const states = await this.getStatesAsync('devices.*');
+        const states = await this.getStatesAsync('devices.*.online');
         for (const id in states) {
-            if (id.endsWith('.online')) {
-                await this.setStateChangedAsync(id, false, true);
-            }
+            await this.setStateChangedAsync(id, false, true);
         }
     }
 
     /**
      * Legt benötigte info.*-States an, falls noch nicht vorhanden.
      */
-    async _ensureInfoStates() {
+    async ensureInfoStates() {
         await this.setObjectNotExistsAsync('info.session', {
             type: 'state',
-            common: { name: 'Gespeicherte Session', type: 'string', role: 'json', read: true, write: false, def: '' },
+            common: {name: 'Gespeicherte Session', type: 'string', role: 'json', read: true, write: false, def: ''},
             native: {},
         });
         await this.setObjectNotExistsAsync('info.MQTT_connection', {
             type: 'state',
-            common: { name: 'If MQTT is connected', type: 'boolean', role: 'indicator.connected', read: true, write: false, def: false },
+            common: {
+                name: 'If MQTT is connected',
+                type: 'boolean',
+                role: 'indicator.connected',
+                read: true,
+                write: false,
+                def: false
+            },
             native: {},
         });
     }
@@ -529,8 +505,8 @@ mqttServerController.closeServer();
     async connectToMQTT() {
         try {
             if (!['exmqtt', 'intmqtt'].includes(this.config.connectionType)) {
-return;
-}
+                return;
+            }
 
             const clientId = `ioBroker.xsense_${Math.random().toString(16).slice(2, 8)}`;
 
@@ -540,7 +516,7 @@ return;
                     return;
                 }
 
-                const mqttOptions = { clientId, clean: true, reconnectPeriod: 500 };
+                const mqttOptions = {clientId, clean: true, reconnectPeriod: 500};
 
                 if (this.config.externalMqttServerCredentials === true) {
                     mqttOptions.username = this.config.externalMqttServerUsername;
@@ -558,7 +534,7 @@ return;
                 await this.delay(1500);
                 mqttClient = mqtt.connect(
                     `mqtt://${this.config.mqttServerIPBind}:${this.config.mqttServerPort}`,
-                    { clientId, clean: true, reconnectPeriod: 500 },
+                    {clientId, clean: true, reconnectPeriod: 500},
                 );
             }
 
@@ -572,14 +548,14 @@ return;
 
                 // Legacy baseTopic (SBS50-Bridge direkt)
                 if (this.config.baseTopic) {
-                    this._mqttSubscribeOnce(this.config.baseTopic);
+                    this.mqttSubscribeOncetates(this.config.baseTopic);
                 }
 
                 // HA-konforme Topics für alle bekannten Stationen subscriben
-                this._subscribeMqttTopics();
+                this.subscribeMqttTopics();
 
                 // Temperatur-Sensoren aktiv anfragen
-                this._requestTemperatureUpdates();
+                this.requestTemperatureUpdates();
             });
 
             mqttClient.on('message', (topic, payload) => {
@@ -590,39 +566,33 @@ return;
                 if (this.xsenseClient) {
                     const station = this.xsenseClient.processMqttMessage(topic, payload);
                     if (station) {
-                        // Station-Daten in ioBroker schreiben
-                        this.json2iob.parseHouses(this.namespace, this.xsenseClient.houses)
-                            .catch(e => this.log.error(`[XSense] MQTT parseHouses Fehler: ${e.message}`));
+                        // Hausname für den ioBroker-Pfad auflösen
+                        let houseFolderId = station.houseId;
+                        for (const house of Object.values(this.xsenseClient.houses)) {
+                            if (house.houseId === station.houseId) {
+                                houseFolderId = (house.name || house.houseId)
+                                    .replace(/\s+/g, '_').replace(/\./g, '_').replace(/[^a-zA-Z0-9_-]/g, '_');
+                                break;
+                            }
+                        }
+                        // Nur die betroffene Station schreiben – nicht alle Häuser neu aufbauen
+                        this.json2iob.parseStation(this.namespace, station, houseFolderId)
+                            .catch(e => this.log.error(`[XSense] MQTT parseStation Fehler: ${e.message}`));
                         return;
                     }
                 }
 
                 // Fallback: Legacy SBS50-Parsing
-                const payloadStr  = payload.toString();
-                const slashIdx    = topic.indexOf('/');
+                const payloadStr = payload.toString();
+                const slashIdx = topic.indexOf('/');
                 const topicSuffix = slashIdx >= 0 ? topic.slice(slashIdx + 1) : topic;
-
-                // Sicherstellen dass payloadStr gültiges JSON ist.
-                // Payload kann ein nackter String sein (z.B. "Normal") – dann JSON.parse()
-                // würde scheitern → in JSON-String einwickeln.
-                let payloadJson;
-                if (payloadStr === '') {
-                    payloadJson = '"null"';
-                } else {
-                    try {
-                        JSON.parse(payloadStr);    // Test: ist es schon gültiges JSON?
-                        payloadJson = payloadStr;
-                    } catch {
-                        payloadJson = JSON.stringify(payloadStr);  // → "Normal" wird zu \"Normal\"
-                    }
-                }
-
-                const newMessage = `{"payload":${payloadJson},"topic":"${topicSuffix}"}`;
+                const newMessage = `{"payload":${payloadStr === '' ? '"null"' : payloadStr},"topic":"${topicSuffix}"}`;
                 this.messageParse(newMessage);
             });
 
             mqttClient.on('error', err => {
                 this.log.error(`[XSense] MQTT-Fehler: ${err.message}`);
+                this.setState('info.MQTT_connection', false, true);
             });
 
             mqttClient.on('offline', () => {
@@ -632,6 +602,7 @@ return;
 
             mqttClient.on('reconnect', () => {
                 this.log.debug('[XSense] MQTT-Client verbindet sich neu...');
+                this.setState('info.MQTT_connection', false, true);
             });
 
         } catch (err) {
@@ -644,10 +615,10 @@ return;
      *
      * @param {string} topic
      */
-    _mqttSubscribeOnce(topic) {
+    mqttSubscribeOncetates(topic) {
         if (!mqttClient || this._mqttSubscribedTopics.has(topic)) {
-return;
-}
+            return;
+        }
         this._mqttSubscribedTopics.add(topic);
         mqttClient.subscribe(topic, err => {
             if (err) {
@@ -664,16 +635,16 @@ return;
      * Quelle: HA coordinator.py → assure_subscriptions()
      * Wird nur im connect-Event aufgerufen – nie im Poll-Zyklus.
      */
-    _subscribeMqttTopics() {
+    subscribeMqttTopics() {
         if (!mqttClient || !this.xsenseClient) {
-return;
-}
+            return;
+        }
 
         for (const house of Object.values(this.xsenseClient.houses)) {
             for (const station of Object.values(house.stations)) {
-                const topics = this.xsenseClient.getMqttTopics(house, station);
+                const topics = this.xsenseClient.getMqttTopics(station);
                 for (const topic of topics) {
-                    this._mqttSubscribeOnce(topic);
+                    this.mqttSubscribeOncetates(topic);
                 }
             }
         }
@@ -683,19 +654,19 @@ return;
      * Fordert Live-Daten für Temperatur/Luftfeuchte-Sensoren an (MQTT Publish).
      * Quelle: HA coordinator.py → request_device_updates() [STH51/STH0A]
      */
-    _requestTemperatureUpdates() {
+    requestTemperatureUpdates() {
         if (!mqttClient || !this.xsenseClient) {
-return;
-}
+            return;
+        }
 
         for (const house of Object.values(this.xsenseClient.houses)) {
             for (const station of Object.values(house.stations)) {
                 const req = this.xsenseClient.buildTemperatureUpdateRequest(station);
                 if (!req) {
-continue;
-}
+                    continue;
+                }
 
-                mqttClient.publish(req.topic, req.payload, { qos: 0, retain: false }, err => {
+                mqttClient.publish(req.topic, req.payload, {qos: 0, retain: false}, err => {
                     if (err) {
                         this.log.warn(`[XSense] Temperature-Update-Request fehlgeschlagen: ${err.message}`);
                     } else {
